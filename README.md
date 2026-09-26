@@ -117,6 +117,7 @@ pytest                             # 运行测试
 | `wav_base64` | string | 必填 | Base64 编码的 WAV：48 kHz、16-bit PCM、单/双声道、1–10 s |
 | `remove_intervals` | array<[int, int]> | 必填 | 半开删除区间 `[start, end)`（输入采样索引）；须严格升序、互不相接（相邻区间至少隔 1 帧）、不越界；空数组表示不删除 |
 | `crossfade_ms` | int | 0 ~ 20 | 接缝淡化时长（毫秒）；0 表示直接拼接 |
+| `cue_intervals` | array<object> | 可选，最多 2000 项 | 输入采样轴上的时间标注；每项含非空唯一字符串 `id` 与整数 `start`/`end`（半开、非空、不越界）；顺序任意、区间可重叠；省略表示无标注 |
 
 响应（200）：
 
@@ -124,6 +125,7 @@ pytest                             # 运行测试
 |---|---|
 | `wav_base64` | 拼接后的 WAV（与输入同格式），Base64；允许短于 1 秒 |
 | `output_frames` | 输出帧数 = 保留帧总数 − 接缝数 × F |
+| `mapped_cues` | 与 `cue_intervals` **同序**的标注映射；未提供标注时为 `[]`。每项含 `id` 与 `fragments`，每片含输入轴 `source_interval` 与输出轴 `output_interval`（均为半开）；整片被删尽时 `fragments` 为空 |
 
 处理规则：
 
@@ -134,8 +136,21 @@ pytest                             # 运行测试
 3. 有接缝时，首/尾保留片段至少 `F` 帧、中间片段至少 `2F` 帧，保证同一采样
    不被两处淡化复用。
 
+标注映射（`cue_intervals` → `mapped_cues`）：
+
+4. 每项标注按删除区间边界切成若干碎片，只保留落在保留片段内的部分；落在删除
+   段内的部分消失，整项完全位于删除段时 `fragments` 为空；碎片按源位置升序、
+   各项整体按请求顺序返回；
+5. 第 `j` 段（从 0 计）内、局部偏移 `t` 的帧映到输出帧
+   `前 j 段总帧数 − j×F + t`，即第 `j` 段输出起点 = 前 j 段总帧数 − j×F；
+6. 跨越接缝的标注，接缝两侧碎片会映到淡化区内**重叠的输出区间**，两片分别
+   保留、不合并；每处接缝只扣除一次 `F`，不会因同一碎片被两段共用而重复扣；
+7. 实现上将标注与片段边界合并为事件**排序扫描**（同一坐标先结束事件后开始
+   事件，片段开始先于同坐标标注开始），不逐项遍历所有保留片段。
+
 错误：`422` —— Base64 非法、WAV 不合规、区间为空/越界/乱序/相接、删除后无
-保留内容（删空）、淡化容量不足、`crossfade_ms` 越界。
+保留内容（删空）、淡化容量不足、`crossfade_ms` 越界、标注数超过 2000、标注
+`id` 为空或重复、标注区间为空或越界。
 
 ### `POST /v1/repair-gaps`
 
@@ -431,12 +446,33 @@ req = urllib.request.Request(
         "wav_base64": base64.b64encode(buf.getvalue()).decode(),
         "remove_intervals": [[48000, 72000], [96000, 105600]],
         "crossfade_ms": 10,
+        "cue_intervals": [
+            # 顺序任意、可重叠；id 必须非空且唯一
+            {"id": "verse", "start": 0, "end": 47000},        # 只在第一段
+            {"id": "chorus", "start": 40000, "end": 110000},  # 跨两处接缝
+            {"id": "gap-only", "start": 48000, "end": 72000}, # 整项被删
+        ],
     }).encode(),
     headers={"Content-Type": "application/json"},
 )
 resp = json.load(urllib.request.urlopen(req))
 # 保留 110400 帧，2 处接缝各重叠 48*10=480 帧 => 109440
 print(resp["output_frames"])  # 109440
+print(json.dumps(resp["mapped_cues"], indent=2, ensure_ascii=False))
+# [
+#   {"id": "verse", "fragments": [
+#     {"source_interval": [0, 47000], "output_interval": [0, 47000]}]},
+#   {"id": "chorus", "fragments": [
+#     {"source_interval": [40000, 48000],   # 第 0 段
+#      "output_interval": [40000, 48000]},
+#     {"source_interval": [72000, 96000],   # 第 1 段：起点 48000-480
+#      "output_interval": [47520, 71520]},
+#     {"source_interval": [105600, 110000], # 第 2 段：起点 72000-960
+#      "output_interval": [71040, 75440]}]},
+#   {"id": "gap-only", "fragments": []}
+# ]
+# 注：chorus 第一/二片输出区间在淡化区重叠 [47520, 48000)，
+# 第二/三片重叠 [71040, 71520)——两侧碎片分别保留，每处接缝只扣一次 F。
 with open("spliced.wav", "wb") as f:
     f.write(base64.b64decode(resp["wav_base64"]))
 EOF
@@ -619,7 +655,7 @@ app/
   main.py          # FastAPI 入口与请求/响应模型
   loudness.py      # WAV 校验、响度/真峰值测量、增益与量化
   compare_gain.py  # 增益/时移核验：归一化互相关、最小二乘增益、残差窗
-  cut_splice.py    # 区间删除、保留片段拼接与接缝线性交叉淡化
+  cut_splice.py    # 区间删除、保留片段拼接与接缝线性交叉淡化、标注区间映射
   repair_gaps.py   # 零值缺口修补：正则化 24 阶 LPC 双向外推融合/线性回退
   denoise.py       # 参考段谱减法降噪：STFT 噪声功率中位数估计与增益平滑
   compress.py      # 前馈压缩：声道联动包络、阈值/压缩比/启动释放/软拐点

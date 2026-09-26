@@ -38,15 +38,15 @@ def make_ramp(n=N, seed=7):
     return rng.integers(-20000, 20000, size=n).astype("<i2")
 
 
-def post_cut(pcm, intervals, crossfade_ms=0, channels=1, rate=RATE):
-    return client.post(
-        "/v1/cut-splice",
-        json={
-            "wav_base64": wav_b64(pcm, channels, rate),
-            "remove_intervals": intervals,
-            "crossfade_ms": crossfade_ms,
-        },
-    )
+def post_cut(pcm, intervals, crossfade_ms=0, channels=1, rate=RATE, cues=None):
+    payload = {
+        "wav_base64": wav_b64(pcm, channels, rate),
+        "remove_intervals": intervals,
+        "crossfade_ms": crossfade_ms,
+    }
+    if cues is not None:
+        payload["cue_intervals"] = cues
+    return client.post("/v1/cut-splice", json=payload)
 
 
 def test_hard_splice_removes_middle():
@@ -260,3 +260,304 @@ def test_missing_field_returns_422(field):
     }
     del payload[field]
     assert client.post("/v1/cut-splice", json=payload).status_code == 422
+
+
+# --- cue_intervals / mapped_cues ---------------------------------------
+
+def cue(cid, start, end):
+    return {"id": cid, "start": start, "end": end}
+
+
+def test_mapped_cues_empty_when_absent_or_empty():
+    pcm = make_ramp()
+    resp = post_cut(pcm, [[100, 200]])
+    assert resp.status_code == 200
+    assert resp.json()["mapped_cues"] == []
+
+    resp = post_cut(pcm, [[100, 200]], cues=[])
+    assert resp.status_code == 200
+    assert resp.json()["mapped_cues"] == []
+
+
+def test_mapped_cues_identity_without_cuts():
+    pcm = make_ramp()
+    resp = post_cut(
+        pcm, [], cues=[cue("a", 100, 200), cue("b", 0, N)]
+    )
+    assert resp.status_code == 200
+    assert resp.json()["mapped_cues"] == [
+        {"id": "a", "fragments": [
+            {"source_interval": [100, 200], "output_interval": [100, 200]}]},
+        {"id": "b", "fragments": [
+            {"source_interval": [0, N], "output_interval": [0, N]}]},
+    ]
+
+
+def test_mapped_cues_hard_splice_multiple_cuts():
+    pcm = make_ramp()
+    cuts = [[1000, 2000], [5000, 6000], [9000, 9500]]
+    # kept: [0,1000) -> out 0; [2000,5000) -> out 1000;
+    #       [6000,9000) -> out 4000; [9500,N) -> out 7000
+    cues_req = [
+        cue("whole", 0, N),          # one piece per kept segment
+        cue("prefix", 0, 500),       # entirely in first segment
+        cue("across-one", 800, 2500),   # [800,1000)+[2000,2500)
+        cue("across-two", 4500, 7000),  # [4500,5000)+[6000,7000)
+        cue("deleted", 1000, 2000),     # exactly a deletion
+        cue("inside-cut", 5200, 5800),  # fully inside a deletion
+        cue("edges", 2000, 5000),       # exactly a kept segment
+        cue("tail", N - 100, N),
+    ]
+    resp = post_cut(pcm, cuts, cues=cues_req)
+    assert resp.status_code == 200
+    mapped = {m["id"]: m["fragments"] for m in resp.json()["mapped_cues"]}
+    assert list(mapped) == [
+        "whole", "prefix", "across-one", "across-two",
+        "deleted", "inside-cut", "edges", "tail",
+    ]
+    assert mapped["whole"] == [
+        {"source_interval": [0, 1000], "output_interval": [0, 1000]},
+        {"source_interval": [2000, 5000], "output_interval": [1000, 4000]},
+        {"source_interval": [6000, 9000], "output_interval": [4000, 7000]},
+        {"source_interval": [9500, N], "output_interval": [7000, N - 2500]},
+    ]
+    assert mapped["prefix"] == [
+        {"source_interval": [0, 500], "output_interval": [0, 500]}]
+    assert mapped["across-one"] == [
+        {"source_interval": [800, 1000], "output_interval": [800, 1000]},
+        {"source_interval": [2000, 2500], "output_interval": [1000, 1500]},
+    ]
+    assert mapped["across-two"] == [
+        {"source_interval": [4500, 5000], "output_interval": [3500, 4000]},
+        {"source_interval": [6000, 7000], "output_interval": [4000, 5000]},
+    ]
+    assert mapped["deleted"] == []
+    assert mapped["inside-cut"] == []
+    assert mapped["edges"] == [
+        {"source_interval": [2000, 5000], "output_interval": [1000, 4000]}]
+    assert mapped["tail"] == [
+        {"source_interval": [N - 100, N],
+         "output_interval": [N - 2600, N - 2500]},
+    ]
+
+
+def test_mapped_cues_piece_frames_match_output_pcm_hard_splice():
+    pcm = make_ramp()
+    cuts = [[1000, 2000], [5000, 6000]]
+    resp = post_cut(pcm, cuts, cues=[cue("c", 500, 8000)])
+    assert resp.status_code == 200
+    _, out = decode_wav(resp.json()["wav_base64"])
+    fragments = resp.json()["mapped_cues"][0]["fragments"]
+    for frag in fragments:
+        s0, s1 = frag["source_interval"]
+        o0, o1 = frag["output_interval"]
+        assert s1 - s0 == o1 - o0
+        assert np.array_equal(out[o0:o1], pcm[s0:s1])
+
+
+def test_cue_order_preserved_and_overlaps_allowed():
+    pcm = make_ramp()
+    resp = post_cut(
+        pcm,
+        [[3000, 4000]],
+        cues=[cue("z", 0, 100), cue("a", 0, N), cue("m", 0, 100)],
+    )
+    assert resp.status_code == 200
+    assert [m["id"] for m in resp.json()["mapped_cues"]] == ["z", "a", "m"]
+
+
+def test_mapped_cues_crossfade_overlap_pieces_kept_separately():
+    pcm = make_ramp()
+    cuts = [[10000, 20000], [40000, 50000]]
+    fade = 48 * 20  # 960
+    resp = post_cut(pcm, cuts, crossfade_ms=20, cues=[cue("x", 0, N)])
+    assert resp.status_code == 200
+    data = resp.json()
+    # kept 76000 - 2*960 = 74080 output frames (unchanged behavior)
+    assert data["output_frames"] == 76000 - 2 * fade
+    fragments = data["mapped_cues"][0]["fragments"]
+    assert fragments == [
+        {"source_interval": [0, 10000], "output_interval": [0, 10000]},
+        {"source_interval": [20000, 40000],
+         "output_interval": [10000 - fade, 30000 - fade]},
+        {"source_interval": [50000, N],
+         "output_interval": [30000 - 2 * fade, 76000 - 2 * fade]},
+    ]
+    # Adjacent pieces overlap by exactly F frames in the crossfade region;
+    # F is subtracted once per seam, never twice per segment.
+    first, second, third = (f["output_interval"] for f in fragments)
+    assert second[0] == first[1] - fade
+    assert third[0] == second[1] - fade
+    assert third[1] == data["output_frames"]
+
+
+def test_mapped_cues_small_cues_inside_crossfade_zones():
+    pcm = make_ramp()
+    fade = 48  # crossfade_ms = 1
+    resp = post_cut(
+        pcm,
+        [[10000, 20000]],
+        crossfade_ms=1,
+        cues=[
+            cue("left-tail", 9900, 10000),
+            cue("right-head", 20000, 20100),
+            cue("bridge", 9900, 20100),
+        ],
+    )
+    assert resp.status_code == 200
+    mapped = {m["id"]: m["fragments"]
+              for m in resp.json()["mapped_cues"]}
+    assert mapped["left-tail"] == [
+        {"source_interval": [9900, 10000], "output_interval": [9900, 10000]}]
+    assert mapped["right-head"] == [
+        {"source_interval": [20000, 20100],
+         "output_interval": [10000 - fade, 10100 - fade]}]
+    # Both sides of the seam map onto overlapping output ranges [9952,10000)
+    # and are still reported as two separate fragments.
+    assert mapped["bridge"] == [
+        {"source_interval": [9900, 10000], "output_interval": [9900, 10000]},
+        {"source_interval": [20000, 20100],
+         "output_interval": [9952, 10052]},
+    ]
+
+
+def test_mapped_cues_boundary_touching_deletions():
+    pcm = make_ramp()
+    resp = post_cut(
+        pcm,
+        [[1000, 2000]],
+        cues=[
+            cue("ends-at-cut-start", 0, 1000),
+            cue("starts-at-cut-end", 2000, 3000),
+        ],
+    )
+    assert resp.status_code == 200
+    mapped = {m["id"]: m["fragments"]
+              for m in resp.json()["mapped_cues"]}
+    assert mapped["ends-at-cut-start"] == [
+        {"source_interval": [0, 1000], "output_interval": [0, 1000]}]
+    assert mapped["starts-at-cut-end"] == [
+        {"source_interval": [2000, 3000], "output_interval": [1000, 2000]}]
+
+
+@pytest.mark.parametrize(
+    "bad_cues",
+    [
+        [cue("a", 0, 10), cue("a", 20, 30)],      # duplicate id
+        [cue("", 0, 10)],                          # empty id
+        [cue("a", 100, 100)],                      # empty interval
+        [cue("a", -1, 100)],                       # negative start
+        [cue("a", N, N + 1)],                      # start out of bounds
+        [cue("a", 0, N + 1)],                      # end out of bounds
+        [cue("a", 500, 100)],                      # start after end
+    ],
+)
+def test_invalid_cue_intervals_return_422(bad_cues):
+    assert post_cut(make_ramp(), [[100, 200]], cues=bad_cues).status_code == 422
+
+
+def test_too_many_cue_intervals_returns_422():
+    pcm = make_ramp()
+    too_many = [cue(f"c{i}", i, i + 1) for i in range(2001)]
+    assert post_cut(pcm, [], cues=too_many).status_code == 422
+
+
+def test_exactly_2000_cue_intervals_accepted():
+    pcm = make_ramp()
+    cues_req = [cue(f"c{i}", i, i + 1) for i in range(2000)]
+    resp = post_cut(pcm, [], cues=cues_req)
+    assert resp.status_code == 200
+    mapped = resp.json()["mapped_cues"]
+    assert len(mapped) == 2000
+    assert mapped[1234] == {
+        "id": "c1234",
+        "fragments": [
+            {"source_interval": [1234, 1235],
+             "output_interval": [1234, 1235]}],
+    }
+
+
+def test_invalid_cues_422_even_when_audio_otherwise_valid():
+    # Duplicate ids must surface as 422 regardless of other fields.
+    pcm = make_ramp()
+    resp = post_cut(
+        pcm, [], cues=[cue("dup", 0, 10), cue("dup", 20, 30)]
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        {"id": "a", "start": 0},               # missing end
+        {"id": "a", "start": 0, "end": 1.5},   # non-integer end
+        {"id": 7, "start": 0, "end": 10},      # non-string id
+    ],
+)
+def test_malformed_cue_objects_return_422(bad_payload):
+    pcm = make_ramp()
+    resp = post_cut(pcm, [], cues=[bad_payload])
+    assert resp.status_code == 422
+
+
+def test_mapped_cues_randomized_matches_bruteforce():
+    rng = np.random.default_rng(2026)
+    n = 48000 * 2
+
+    def brute_force(cues_req, remove, fade):
+        segs, cur = [], 0
+        for a, b in remove:
+            if a > cur:
+                segs.append((cur, a))
+            cur = b
+        if cur < n:
+            segs.append((cur, n))
+        out_starts, prefix = [], 0
+        for j, (a, b) in enumerate(segs):
+            out_starts.append(prefix - j * fade)
+            prefix += b - a
+        result = []
+        for c in cues_req:
+            frags = []
+            for j, (a, b) in enumerate(segs):
+                lo, hi = max(c["start"], a), min(c["end"], b)
+                if lo < hi:
+                    frags.append({
+                        "source_interval": [lo, hi],
+                        "output_interval": [
+                            out_starts[j] + lo - a,
+                            out_starts[j] + hi - a,
+                        ],
+                    })
+            result.append({"id": c["id"], "fragments": frags})
+        return result
+
+    for trial in range(40):
+        fade_ms = int(rng.integers(0, 3))
+        fade = 48 * fade_ms
+        # Build well-spaced segments (>= 3000 frames) and deletions.
+        n_cuts = int(rng.integers(0, 5))
+        x = int(rng.integers(0, 1000))
+        remove = []
+        for _ in range(n_cuts):
+            seg_len = int(rng.integers(3000, 8000))
+            cut_len = int(rng.integers(100, 1000))
+            a = x + seg_len
+            remove.append([a, a + cut_len])
+            x = a + cut_len
+        if x >= n - 3000:
+            remove = remove[:-1] if remove else []
+        n_cues = int(rng.integers(0, 12))
+        cues_req = []
+        for k in range(n_cues):
+            s = int(rng.integers(0, n))
+            e = s + 1 + int(rng.integers(0, min(6000, n - s)))
+            cues_req.append(cue(f"cue{k}", s, e))
+        resp = post_cut(
+            make_ramp(seed=trial), remove,
+            crossfade_ms=fade_ms, cues=cues_req,
+        )
+        assert resp.status_code == 200, trial
+        assert resp.json()["mapped_cues"] == brute_force(
+            cues_req, remove, fade
+        )

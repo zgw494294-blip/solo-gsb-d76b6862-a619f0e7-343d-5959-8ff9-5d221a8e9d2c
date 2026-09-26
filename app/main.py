@@ -87,6 +87,18 @@ class CompareGainResponse(BaseModel):
     )
 
 
+class CueIntervalModel(BaseModel):
+    id: str = Field(
+        ..., min_length=1, description="Unique non-empty cue identifier"
+    )
+    start: int = Field(
+        ..., description="Cue start frame on the input sample axis (inclusive)"
+    )
+    end: int = Field(
+        ..., description="Cue end frame on the input sample axis (exclusive)"
+    )
+
+
 class CutSpliceRequest(BaseModel):
     wav_base64: str = Field(
         ...,
@@ -104,6 +116,32 @@ class CutSpliceRequest(BaseModel):
         le=20,
         description="Seam crossfade length in milliseconds; 0 = hard splice",
     )
+    cue_intervals: list[CueIntervalModel] | None = Field(
+        None,
+        max_length=2000,
+        description="Optional time annotations on the input sample axis; "
+        "ids unique, intervals half-open and in bounds; order arbitrary, "
+        "overlap allowed",
+    )
+
+
+class CueFragmentModel(BaseModel):
+    source_interval: tuple[int, int] = Field(
+        ..., description="Half-open [start, end) piece on the input sample axis"
+    )
+    output_interval: tuple[int, int] = Field(
+        ..., description="Half-open [start, end) piece on the output axis; "
+        "fragments of different cues or of one cue across a seam may overlap "
+        "inside a crossfade region",
+    )
+
+
+class MappedCueModel(BaseModel):
+    id: str
+    fragments: list[CueFragmentModel] = Field(
+        ..., description="Surviving pieces in ascending source order; empty "
+        "when the whole cue was deleted",
+    )
 
 
 class CutSpliceResponse(BaseModel):
@@ -111,6 +149,11 @@ class CutSpliceResponse(BaseModel):
     output_frames: int = Field(
         ...,
         description="Output frames: kept frames minus seams x fade frames",
+    )
+    mapped_cues: list[MappedCueModel] = Field(
+        ...,
+        description="One entry per cue_intervals item, in request order; "
+        "empty when no cue_intervals were provided",
     )
 
 
@@ -336,8 +379,19 @@ def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
         ) from exc
 
     try:
+        cue_intervals = (
+            [
+                (cue.id, cue.start, cue.end)
+                for cue in request.cue_intervals
+            ]
+            if request.cue_intervals is not None
+            else None
+        )
         result = cut_splice_wav(
-            wav_bytes, request.remove_intervals, request.crossfade_ms
+            wav_bytes,
+            request.remove_intervals,
+            request.crossfade_ms,
+            cue_intervals,
         )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -345,6 +399,19 @@ def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
     return CutSpliceResponse(
         wav_base64=base64.b64encode(result.wav_bytes).decode("ascii"),
         output_frames=result.output_frames,
+        mapped_cues=[
+            MappedCueModel(
+                id=cue.id,
+                fragments=[
+                    CueFragmentModel(
+                        source_interval=fragment.source_interval,
+                        output_interval=fragment.output_interval,
+                    )
+                    for fragment in cue.fragments
+                ],
+            )
+            for cue in result.mapped_cues
+        ],
     )
 
 
