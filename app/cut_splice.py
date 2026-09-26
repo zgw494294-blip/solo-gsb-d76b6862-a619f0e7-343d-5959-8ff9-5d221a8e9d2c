@@ -10,10 +10,17 @@ the first/last kept segments must hold at least F frames and every middle
 segment at least 2F frames, so the two fades of a middle segment never
 share a sample. The output keeps the input format and may be shorter
 than one second.
+
+Optional cue intervals on the input sample axis are mapped onto the
+spliced output: every cue is intersected with the kept segments and each
+surviving fragment is reported with its source interval and its interval
+on the output timeline. Kept segment j (0-based) starts at output frame
+(kept frames before it) - j*F, so the two fragments flanking a crossfade
+zone map to overlapping output intervals; both are kept as-is.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -30,9 +37,35 @@ FRAMES_PER_MS = SAMPLE_RATE // 1000
 
 
 @dataclass
+class CueInterval:
+    """A named half-open interval on the input sample axis."""
+
+    id: str
+    start: int
+    end: int
+
+
+@dataclass
+class CueFragment:
+    """The part of a cue inside one kept segment, on both timelines."""
+
+    source_interval: tuple[int, int]
+    output_interval: tuple[int, int]
+
+
+@dataclass
+class MappedCue:
+    """A cue and its surviving fragments, in ascending source order."""
+
+    id: str
+    fragments: list[CueFragment] = field(default_factory=list)
+
+
+@dataclass
 class CutSpliceResult:
     wav_bytes: bytes
     output_frames: int
+    mapped_cues: list[MappedCue] = field(default_factory=list)
 
 
 def _validate_intervals(
@@ -59,19 +92,33 @@ def _validate_intervals(
     return intervals
 
 
-def _kept_segments(
-    samples: np.ndarray, intervals: list[tuple[int, int]]
-) -> list[np.ndarray]:
-    """Non-empty kept regions between the deletion intervals, in order."""
-    segments: list[np.ndarray] = []
+def _validate_cues(cues: list[CueInterval], n_frames: int) -> None:
+    """Check cue ids are unique and every interval is non-empty/in bounds."""
+    seen: set[str] = set()
+    for cue in cues:
+        if cue.id in seen:
+            raise AudioValidationError(f"Duplicate cue id: {cue.id!r}")
+        seen.add(cue.id)
+        if not 0 <= cue.start < cue.end <= n_frames:
+            raise AudioValidationError(
+                f"Cue interval [{cue.start}, {cue.end}) is empty or outside "
+                f"[0, {n_frames})"
+            )
+
+
+def _kept_bounds(
+    n_frames: int, intervals: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Half-open [start, end) bounds of the kept regions, in order."""
+    bounds: list[tuple[int, int]] = []
     cursor = 0
     for start, end in intervals:
         if start > cursor:
-            segments.append(samples[cursor:start])
+            bounds.append((cursor, start))
         cursor = end
-    if cursor < samples.shape[0]:
-        segments.append(samples[cursor:])
-    return segments
+    if cursor < n_frames:
+        bounds.append((cursor, n_frames))
+    return bounds
 
 
 def _splice(segments: list[np.ndarray], fade_frames: int) -> np.ndarray:
@@ -92,17 +139,76 @@ def _splice(segments: list[np.ndarray], fade_frames: int) -> np.ndarray:
     return np.concatenate(pieces, axis=0)
 
 
+def _map_cues(
+    cues: list[CueInterval],
+    kept_bounds: list[tuple[int, int]],
+    fade_frames: int,
+) -> list[MappedCue]:
+    """Map every cue interval onto the spliced output timeline.
+
+    Kept segment j (0-based) starts at output frame (kept frames before
+    it) - j*F, so a source frame x inside segment [s, e) lands at
+    x + out_start_j - s. The two fragments flanking a crossfade zone
+    therefore map to output intervals that overlap by up to F frames;
+    both are reported as-is, never merged. Cues are sorted by start and
+    swept against the ascending segments in one pass, so the total work
+    is O(cues log cues + segments + fragments) instead of cues x
+    segments. The result is restored to request order.
+    """
+    # Output start of every kept segment: cumulative kept frames minus
+    # one F per seam already crossed.
+    out_starts: list[int] = []
+    out_start = 0
+    for seg_start, seg_end in kept_bounds:
+        out_starts.append(out_start)
+        out_start += (seg_end - seg_start) - fade_frames
+
+    fragments: list[list[CueFragment]] = [[] for _ in cues]
+    order = sorted(range(len(cues)), key=lambda i: (cues[i].start, i))
+    seg_idx = 0
+    n_seg = len(kept_bounds)
+    for i in order:
+        cue = cues[i]
+        # Segments ending at or before the cue start intersect neither
+        # this cue nor any later one (cue starts are sorted ascending).
+        while seg_idx < n_seg and kept_bounds[seg_idx][1] <= cue.start:
+            seg_idx += 1
+        j = seg_idx
+        while j < n_seg and kept_bounds[j][0] < cue.end:
+            seg_start, seg_end = kept_bounds[j]
+            lo = max(cue.start, seg_start)
+            hi = min(cue.end, seg_end)
+            if lo < hi:
+                shift = out_starts[j] - seg_start
+                fragments[i].append(
+                    CueFragment(
+                        source_interval=(lo, hi),
+                        output_interval=(lo + shift, hi + shift),
+                    )
+                )
+            j += 1
+    return [
+        MappedCue(id=cue.id, fragments=fragments[i])
+        for i, cue in enumerate(cues)
+    ]
+
+
 def cut_splice_wav(
     wav_bytes: bytes,
     remove_intervals: list[tuple[int, int]],
     crossfade_ms: int,
+    cue_intervals: list[CueInterval] | None = None,
 ) -> CutSpliceResult:
     samples = _read_wav(wav_bytes)
     n_frames, channels = samples.shape
     fade_frames = FRAMES_PER_MS * crossfade_ms
 
     intervals = _validate_intervals(remove_intervals, n_frames)
-    segments = _kept_segments(samples, intervals)
+    cues = list(cue_intervals) if cue_intervals else []
+    _validate_cues(cues, n_frames)
+
+    bounds = _kept_bounds(n_frames, intervals)
+    segments = [samples[start:end] for start, end in bounds]
     if not segments:
         raise AudioValidationError("remove_intervals delete the entire file")
 
@@ -122,5 +228,7 @@ def cut_splice_wav(
     spliced = _splice(segments, fade_frames)
     pcm = _quantize(spliced)
     return CutSpliceResult(
-        wav_bytes=_write_wav(pcm, channels), output_frames=int(pcm.shape[0])
+        wav_bytes=_write_wav(pcm, channels),
+        output_frames=int(pcm.shape[0]),
+        mapped_cues=_map_cues(cues, bounds, fade_frames),
     )

@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from .align_stereo import align_stereo_wav
 from .compare_gain import compare_wav_gain
 from .compress import compress_wav
-from .cut_splice import cut_splice_wav
+from .cut_splice import CueInterval, cut_splice_wav
 from .denoise import denoise_wav
 from .loudness import SAMPLE_RATE, AudioValidationError, normalize_wav
 from .repair_gaps import RepairMethod, repair_gaps_wav
@@ -87,6 +87,12 @@ class CompareGainResponse(BaseModel):
     )
 
 
+class CueIntervalModel(BaseModel):
+    id: str = Field(..., min_length=1, description="Unique non-empty cue id")
+    start: int = Field(..., description="Cue start frame (inclusive)")
+    end: int = Field(..., description="Cue end frame (exclusive)")
+
+
 class CutSpliceRequest(BaseModel):
     wav_base64: str = Field(
         ...,
@@ -104,6 +110,30 @@ class CutSpliceRequest(BaseModel):
         le=20,
         description="Seam crossfade length in milliseconds; 0 = hard splice",
     )
+    cue_intervals: list[CueIntervalModel] | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional cue intervals on the input sample axis; "
+        "half-open [start, end), in bounds, unique non-empty ids; "
+        "any order, overlaps allowed",
+    )
+
+
+class CueFragmentModel(BaseModel):
+    source_interval: tuple[int, int] = Field(
+        ..., description="Half-open fragment on the input sample axis"
+    )
+    output_interval: tuple[int, int] = Field(
+        ..., description="The same fragment on the spliced output timeline"
+    )
+
+
+class MappedCueModel(BaseModel):
+    id: str = Field(..., description="Cue id from the request")
+    fragments: list[CueFragmentModel] = Field(
+        ..., description="Surviving fragments, ascending source order; "
+        "empty when the cue is fully deleted",
+    )
 
 
 class CutSpliceResponse(BaseModel):
@@ -111,6 +141,11 @@ class CutSpliceResponse(BaseModel):
     output_frames: int = Field(
         ...,
         description="Output frames: kept frames minus seams x fade frames",
+    )
+    mapped_cues: list[MappedCueModel] = Field(
+        ...,
+        description="Requested cues mapped onto the output timeline, in "
+        "request order; empty when cue_intervals was not provided",
     )
 
 
@@ -337,7 +372,13 @@ def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
 
     try:
         result = cut_splice_wav(
-            wav_bytes, request.remove_intervals, request.crossfade_ms
+            wav_bytes,
+            request.remove_intervals,
+            request.crossfade_ms,
+            [
+                CueInterval(id=cue.id, start=cue.start, end=cue.end)
+                for cue in request.cue_intervals or []
+            ],
         )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -345,6 +386,19 @@ def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
     return CutSpliceResponse(
         wav_base64=base64.b64encode(result.wav_bytes).decode("ascii"),
         output_frames=result.output_frames,
+        mapped_cues=[
+            MappedCueModel(
+                id=cue.id,
+                fragments=[
+                    CueFragmentModel(
+                        source_interval=fragment.source_interval,
+                        output_interval=fragment.output_interval,
+                    )
+                    for fragment in cue.fragments
+                ],
+            )
+            for cue in result.mapped_cues
+        ],
     )
 
 

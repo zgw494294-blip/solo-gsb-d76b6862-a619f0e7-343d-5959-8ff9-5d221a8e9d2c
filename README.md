@@ -107,7 +107,8 @@ pytest                             # 运行测试
 ### `POST /v1/cut-splice`
 
 按输入采样索引删除若干半开区间，把保留片段按原顺序拼接，并在每处接缝做线性
-交叉淡化。输入 WAV 校验与 `/v1/normalize` 相同（48 kHz / 16-bit PCM /
+交叉淡化；可选地携带一组**时间标注**（cue），响应给出每个标注在输出时间轴上
+的映射。输入 WAV 校验与 `/v1/normalize` 相同（48 kHz / 16-bit PCM /
 单或双声道 / 1–10 s）。
 
 请求体（JSON）：
@@ -117,6 +118,7 @@ pytest                             # 运行测试
 | `wav_base64` | string | 必填 | Base64 编码的 WAV：48 kHz、16-bit PCM、单/双声道、1–10 s |
 | `remove_intervals` | array<[int, int]> | 必填 | 半开删除区间 `[start, end)`（输入采样索引）；须严格升序、互不相接（相邻区间至少隔 1 帧）、不越界；空数组表示不删除 |
 | `crossfade_ms` | int | 0 ~ 20 | 接缝淡化时长（毫秒）；0 表示直接拼接 |
+| `cue_intervals` | array<object> | 可选，≤ 2000 项 | 输入采样轴上的半开标注区间 `[start, end)`；每项含非空且唯一的字符串 `id` 与整数 `start`/`end`；顺序任意、可互相重叠；省略时不做映射 |
 
 响应（200）：
 
@@ -124,6 +126,11 @@ pytest                             # 运行测试
 |---|---|
 | `wav_base64` | 拼接后的 WAV（与输入同格式），Base64；允许短于 1 秒 |
 | `output_frames` | 输出帧数 = 保留帧总数 − 接缝数 × F |
+| `mapped_cues` | 按**请求顺序**给出的标注映射；未提供 `cue_intervals` 时为空数组 |
+| `mapped_cues[].id` | 请求中的标注 id |
+| `mapped_cues[].fragments` | 该标注与保留片段相交的碎片，按源位置升序；整项被删尽时为空数组 |
+| `mapped_cues[].fragments[].source_interval` | 碎片在输入采样轴上的半开区间 |
+| `mapped_cues[].fragments[].output_interval` | 同一碎片在输出时间轴上的半开区间 |
 
 处理规则：
 
@@ -132,10 +139,17 @@ pytest                             # 运行测试
    逐帧按从 0 到 1（含端点）的线性权重混合：第 `i` 帧（0 起）右段权重
    `i/(F-1)`、左段权重 `1 − i/(F-1)`；`F = 0` 时直接拼接；
 3. 有接缝时，首/尾保留片段至少 `F` 帧、中间片段至少 `2F` 帧，保证同一采样
-   不被两处淡化复用。
+   不被两处淡化复用；
+4. 标注映射：第 `j` 段保留片段（从 0 计）的输出起点 = 前 `j` 段总帧数 −
+   `j × F`，源帧 `x` 落在第 `j` 段 `[s, e)` 内时映到 `x + 输出起点_j − s`。
+   每个标注与所有保留片段求交，落在删除段内的部分消失；交叉淡化区两侧的
+   碎片会映到**重叠**的输出区间（重叠不超过 F 帧），两侧都原样保留，
+   不合并、也不重复扣除 F。映射按「标注排序 + 保留片段单次扫描」完成，
+   不逐项遍历全部保留片段。
 
 错误：`422` —— Base64 非法、WAV 不合规、区间为空/越界/乱序/相接、删除后无
-保留内容（删空）、淡化容量不足、`crossfade_ms` 越界。
+保留内容（删空）、淡化容量不足、`crossfade_ms` 越界、标注 id 为空或重复、
+标注区间为空/越界、标注超过 2000 项。
 
 ### `POST /v1/repair-gaps`
 
@@ -412,7 +426,8 @@ EOF
 ```
 
 ```bash
-# 生成 3 秒测试 WAV，删除 1.0–1.5 s 与 2.0–2.2 s 两段，接缝淡化 10 ms
+# 生成 3 秒测试 WAV，删除 1.0–1.5 s 与 2.0–2.2 s 两段，接缝淡化 10 ms，
+# 并同步 4 条时间标注到剪辑后的时间轴
 python3 - <<'EOF'
 import base64, io, json, wave, urllib.request
 import numpy as np
@@ -431,12 +446,26 @@ req = urllib.request.Request(
         "wav_base64": base64.b64encode(buf.getvalue()).decode(),
         "remove_intervals": [[48000, 72000], [96000, 105600]],
         "crossfade_ms": 10,
+        "cue_intervals": [
+            {"id": "intro",    "start": 0,      "end": 48000},
+            {"id": "verse",    "start": 47000,  "end": 73000},   # 跨越删除段
+            {"id": "cut-away", "start": 50000,  "end": 60000},   # 整段被删除
+            {"id": "outro",    "start": 110000, "end": 120000},
+        ],
     }).encode(),
     headers={"Content-Type": "application/json"},
 )
 resp = json.load(urllib.request.urlopen(req))
 # 保留 110400 帧，2 处接缝各重叠 48*10=480 帧 => 109440
 print(resp["output_frames"])  # 109440
+for cue in resp["mapped_cues"]:
+    print(cue["id"], cue["fragments"])
+# intro    [{'source_interval': [0, 48000], 'output_interval': [0, 48000]}]
+# verse    [{'source_interval': [47000, 48000], 'output_interval': [47000, 48000]},
+#           {'source_interval': [72000, 73000], 'output_interval': [47520, 48520]}]
+#          # 两片输出区间在交叉淡化区重叠 480 帧（F），分别保留不合并
+# cut-away []                        # 整项删尽，碎片为空
+# outro    [{'source_interval': [110000, 120000], 'output_interval': [75440, 85440]}]
 with open("spliced.wav", "wb") as f:
     f.write(base64.b64decode(resp["wav_base64"]))
 EOF
@@ -619,7 +648,7 @@ app/
   main.py          # FastAPI 入口与请求/响应模型
   loudness.py      # WAV 校验、响度/真峰值测量、增益与量化
   compare_gain.py  # 增益/时移核验：归一化互相关、最小二乘增益、残差窗
-  cut_splice.py    # 区间删除、保留片段拼接与接缝线性交叉淡化
+  cut_splice.py    # 区间删除、保留片段拼接、接缝线性交叉淡化与标注映射
   repair_gaps.py   # 零值缺口修补：正则化 24 阶 LPC 双向外推融合/线性回退
   denoise.py       # 参考段谱减法降噪：STFT 噪声功率中位数估计与增益平滑
   compress.py      # 前馈压缩：声道联动包络、阈值/压缩比/启动释放/软拐点
